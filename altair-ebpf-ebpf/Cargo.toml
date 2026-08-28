@@ -1,0 +1,17 @@
+[package]
+name = "altair-ebpf-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+altair-ebpf-common = { path = "../altair-ebpf-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "altair-ebpf"
+path = "src/main.rs"

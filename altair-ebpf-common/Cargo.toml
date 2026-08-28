@@ -1,0 +1,13 @@
+[package]
+name = "altair-ebpf-common"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+user = ["aya", "bytemuck"]
+
+[dependencies]
+aya = { workspace = true, optional = true }
+bytemuck = { version = "1", optional = true }
