@@ -3,8 +3,6 @@
   <img src="https://github.com/user-attachments/assets/998c35d1-5ea0-4087-9cf0-50388b8851e4" width="400" alt="Altair-Ebpf Logo">
 </p>
 
-
-
 # altair-ebpf
 
 ## Prerequisites
