@@ -6,6 +6,7 @@ pub struct ExecEvent {
     pub pid: u32,
     pub tgid: u32,
     pub uid: u32,
+    pub cgroup_id: u64,
     pub comm: [u8; 16],
     pub filename: [u8; 256],
 }
