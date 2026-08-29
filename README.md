@@ -7,72 +7,92 @@
 
 # Altair eBPF
 
-Runtime process execution monitor built with **Rust + eBPF (Aya)**, with early **container awareness** for Docker/Linux environments.
+Runtime process execution monitor built with **Rust + eBPF (Aya)**, focused on early **Docker/container awareness**.
 
 > Status: **Learning / Prototype**  
 > Not production-ready.
 
 ---
 
-## What it does
+## Overview
 
-Altair attaches to the kernel tracepoint `sys_enter_execve` and monitors process executions in real time.
+Altair attaches to the Linux kernel tracepoint `sys_enter_execve` and monitors process executions in real time.
 
-For each event, it collects:
-- PID / TGID
-- UID
-- Process name (`comm`)
-- Binary path
-- cgroup id (for container awareness)
+Events are streamed from kernel space to userspace through a **RingBuf**, then enriched with container context using:
 
-It then classifies events as:
-- `HOST`
-- `CONTAINER`
+- Docker PID / namespace tracking
+- cgroup inode correlation
+- `/proc` fallback inspection
 
-and raises a simple alert when a **root shell/tool** is executed inside a container.
+The tool can classify events as `HOST` or `CONTAINER`, and raise a simple alert when a root shell/tool runs inside a container.
 
 ---
-```
+
 ## Features
 
 ### Working
-- eBPF-based process execution monitoring
+
+- eBPF-based process execution monitoring (`sys_enter_execve`)
 - Kernel → userspace event streaming via RingBuf
-- Basic terminal UI
-- Container awareness using cgroup id + `/proc` enrichment
-- Simple alert rule for suspicious root activity in containers
+- Container awareness for Docker workloads
+- `--container-only` mode (hide host events)
+- Simple terminal UI with colored logs
+- Alert on suspicious root activity inside containers
+  - examples: `/bin/sh`, `/bin/bash`, `/bin/busybox`, `curl`, `wget`, `python`, `nc`
+- Internal noise filtering (self process / Docker CLI used for tracking)
 
 ### Not yet
-- `--container-only` filter mode
-- Docker metadata enrichment (container name/image)
-- Advanced detection rules / severity levels
-- Persistent logging / SIEM export
-- Production hardening
+
+- Advanced severity model (`INFO` / `LOW` / `MEDIUM` / `HIGH`)
+- Docker metadata enrichment (container name, image)
+- JSON / file logging
+- Network or filesystem detectors
+- Production packaging and hardening
 
 ---
 
 ## Architecture
 
-
+```text
 Linux Kernel
   └─ tracepoint: sys_enter_execve
         └─ eBPF program (Aya)
-              └─ RingBuf events
+              └─ RingBuf event stream
                     └─ Rust userspace
-                          ├─ parse event
-                          ├─ detect host vs container
+                          ├─ parse ExecEvent
+                          ├─ detect HOST vs CONTAINER
+                          ├─ apply --container-only filter
                           └─ print logs / alerts
+```
+
+Container detection strategy:
+
+1. Match event `cgroup_id` with active Docker container cgroup inodes
+2. Match process PID namespace with running container namespaces
+3. Fallback to `/proc/<pid>/cgroup` text inspection
+
+---
+
+## Project structure
+
+```text
+altair-ebpf/
+├── altair-ebpf/           # userspace application
+├── altair-ebpf-ebpf/      # eBPF program
+├── altair-ebpf-common/    # shared event struct
+├── Cargo.toml
+└── README.md
 ```
 
 ---
 
 ## Requirements
 
-- Linux (tested on Parrot/WSL2-like environments)
-- Rust toolchain (nightly recommended for eBPF build)
+- Linux environment with eBPF support
+- Rust toolchain (nightly may be required for eBPF build)
 - `bpf-linker`
 - Root privileges to load eBPF programs
-- Docker (optional, for container testing)
+- Docker (for container detection features)
 
 ---
 
@@ -90,78 +110,80 @@ cargo build --release
 
 ---
 
-## Run
+## Usage
+
+### Show all events (host + container)
 
 ```bash
 sudo ./target/debug/altair-ebpf
 ```
 
-or:
+### Show container events only
 
 ```bash
-sudo ./target/release/altair-ebpf
+sudo ./target/debug/altair-ebpf --container-only
+```
+
+### Help
+
+```bash
+./target/debug/altair-ebpf --help
 ```
 
 ---
 
 ## Example output
 
+### Container event
+
 ```text
-[✓] eBPF program loaded
-[✓] Attached to sys_enter_execve
-[✓] Container awareness enabled (cgroup_id)
-[*] Listening... (Ctrl+C to stop)
+• [CONTAINER] pid=15483 uid=0 comm=sh cid=07a246c48261 → /usr/bin/whoami
+• [CONTAINER] pid=15607 uid=0 comm=sh cid=07a246c48261 → /bin/ls
+```
 
-• [HOST] pid=2032 uid=0 comm=bash → /usr/bin/ls
+### Alert
 
-• [CONTAINER] pid=16422 uid=0 comm=sh cid=cg:22 → /bin/ls
-
+```text
 ┌─ ALERT [CONTAINER] ─────────────────────────────
-│  PID         : 16418
+│  PID         : 16633
 │  UID         : 0
-│  COMM        : bash
-│  BINARY      : /bin/bash
-│  CONTAINER   : cg:22
-│  CGROUP_ID   : 22
+│  COMM        : sh
+│  BINARY      : /bin/sh
+│  CONTAINER   : 07a246c48261
+│  CGROUP_ID   : 4965
 │  REASON      : root shell/tool inside container
 └────────────────────────────────────────────────
 ```
 
 ---
 
-## Test with Docker
+## Quick test
 
 Terminal 1:
 
 ```bash
-sudo ./target/debug/altair-ebpf
+cd /path/to/altair-ebpf
+sudo ./target/debug/altair-ebpf --container-only
 ```
 
 Terminal 2:
 
 ```bash
+# should stay quiet in container-only mode
+whoami
+ls
+
+# should produce CONTAINER events / alerts
 docker run --rm -it alpine sh
 whoami
 ls
 ```
 
 Expected:
-- host commands appear as `[HOST]`
+
+- host commands are hidden in `--container-only`
 - container commands appear as `[CONTAINER]`
-- root shell inside container may trigger `ALERT [CONTAINER]`
-
----
-
-## Project structure
-
-```text
-altair-ebpf/
-├── altair-ebpf/              # userspace application
-├── altair-ebpf-ebpf/         # eBPF program
-├── altair-ebpf-common/       # shared event struct
-├── Cargo.toml
-└── README.md
-```
+- container root shell may trigger `ALERT [CONTAINER]`
 
 ---
 
@@ -169,31 +191,32 @@ altair-ebpf/
 
 Very simple prototype rules:
 
-- Classify by cgroup information
-- Alert if:
-  - event is inside container
-  - UID is 0
-  - binary looks like shell/tool (`sh`, `bash`, `curl`, `wget`, `python`, `nc`, etc.)
+- Classify process as container using Docker/namespace/cgroup correlation
+- Alert if all are true:
+  - event is inside a container
+  - UID is `0`
+  - binary looks like a shell or common probing tool
 
-This will produce false positives and is intended for learning.
+This can still produce false positives/negatives and is intended for learning.
 
 ---
 
 ## Roadmap
 
-- [ ] `--container-only` mode
-- [ ] Reduce false positives with better rules
-- [ ] Enrich events with Docker container name/image
+- [x] Runtime execve monitoring with eBPF + Aya
+- [x] Container awareness
+- [x] `--container-only` mode
+- [ ] Better alert rules and severity levels
+- [ ] Enrich events with container name/image
 - [ ] JSON logging
-- [ ] Severity levels (`INFO`, `LOW`, `MEDIUM`, `HIGH`)
 - [ ] Optional network/file-related detectors
 
 ---
 
 ## Disclaimer
 
-This project is for **education and research**.
-Do not use it as a complete runtime security solution.
+This project is for **education and research**.  
+It is not a complete runtime security product and should not be treated as production EDR/CDR.
 
 ---
 
