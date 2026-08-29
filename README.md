@@ -3,38 +3,199 @@
   <img src="https://github.com/user-attachments/assets/998c35d1-5ea0-4087-9cf0-50388b8851e4" width="400" alt="Altair-Ebpf Logo">
 </p>
 
-# altair-ebpf
 
-## Prerequisites
 
-1. stable rust toolchains: `rustup toolchain install stable`
-1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
-1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
-1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
-1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
+# Altair eBPF
 
-## Build & Run
+Runtime process execution monitor built with **Rust + eBPF (Aya)**, with early **container awareness** for Docker/Linux environments.
 
-Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
+> Status: **Learning / Prototype**  
+> Not production-ready.
 
-```shell
-cargo run --release
+---
+
+## What it does
+
+Altair attaches to the kernel tracepoint `sys_enter_execve` and monitors process executions in real time.
+
+For each event, it collects:
+- PID / TGID
+- UID
+- Process name (`comm`)
+- Binary path
+- cgroup id (for container awareness)
+
+It then classifies events as:
+- `HOST`
+- `CONTAINER`
+
+and raises a simple alert when a **root shell/tool** is executed inside a container.
+
+---
+```
+## Features
+
+### Working
+- eBPF-based process execution monitoring
+- Kernel → userspace event streaming via RingBuf
+- Basic terminal UI
+- Container awareness using cgroup id + `/proc` enrichment
+- Simple alert rule for suspicious root activity in containers
+
+### Not yet
+- `--container-only` filter mode
+- Docker metadata enrichment (container name/image)
+- Advanced detection rules / severity levels
+- Persistent logging / SIEM export
+- Production hardening
+
+---
+
+## Architecture
+
+
+Linux Kernel
+  └─ tracepoint: sys_enter_execve
+        └─ eBPF program (Aya)
+              └─ RingBuf events
+                    └─ Rust userspace
+                          ├─ parse event
+                          ├─ detect host vs container
+                          └─ print logs / alerts
 ```
 
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the
-program.
+---
 
-## Cross-compiling on macOS
+## Requirements
 
-Cross compilation should work on both Intel and Apple Silicon Macs.
+- Linux (tested on Parrot/WSL2-like environments)
+- Rust toolchain (nightly recommended for eBPF build)
+- `bpf-linker`
+- Root privileges to load eBPF programs
+- Docker (optional, for container testing)
 
-```shell
-cargo build --package altair-ebpf --release \
-  --target=${ARCH}-unknown-linux-musl \
-  --config=target.${ARCH}-unknown-linux-musl.linker=\"rust-lld\"
+---
+
+## Build
+
+```bash
+cargo build
 ```
-The cross-compiled program `target/${ARCH}-unknown-linux-musl/release/altair-ebpf` can be
-copied to a Linux server or VM and run there.
+
+Release build:
+
+```bash
+cargo build --release
+```
+
+---
+
+## Run
+
+```bash
+sudo ./target/debug/altair-ebpf
+```
+
+or:
+
+```bash
+sudo ./target/release/altair-ebpf
+```
+
+---
+
+## Example output
+
+```text
+[✓] eBPF program loaded
+[✓] Attached to sys_enter_execve
+[✓] Container awareness enabled (cgroup_id)
+[*] Listening... (Ctrl+C to stop)
+
+• [HOST] pid=2032 uid=0 comm=bash → /usr/bin/ls
+
+• [CONTAINER] pid=16422 uid=0 comm=sh cid=cg:22 → /bin/ls
+
+┌─ ALERT [CONTAINER] ─────────────────────────────
+│  PID         : 16418
+│  UID         : 0
+│  COMM        : bash
+│  BINARY      : /bin/bash
+│  CONTAINER   : cg:22
+│  CGROUP_ID   : 22
+│  REASON      : root shell/tool inside container
+└────────────────────────────────────────────────
+```
+
+---
+
+## Test with Docker
+
+Terminal 1:
+
+```bash
+sudo ./target/debug/altair-ebpf
+```
+
+Terminal 2:
+
+```bash
+docker run --rm -it alpine sh
+whoami
+ls
+```
+
+Expected:
+- host commands appear as `[HOST]`
+- container commands appear as `[CONTAINER]`
+- root shell inside container may trigger `ALERT [CONTAINER]`
+
+---
+
+## Project structure
+
+```text
+altair-ebpf/
+├── altair-ebpf/              # userspace application
+├── altair-ebpf-ebpf/         # eBPF program
+├── altair-ebpf-common/       # shared event struct
+├── Cargo.toml
+└── README.md
+```
+
+---
+
+## Current detection logic
+
+Very simple prototype rules:
+
+- Classify by cgroup information
+- Alert if:
+  - event is inside container
+  - UID is 0
+  - binary looks like shell/tool (`sh`, `bash`, `curl`, `wget`, `python`, `nc`, etc.)
+
+This will produce false positives and is intended for learning.
+
+---
+
+## Roadmap
+
+- [ ] `--container-only` mode
+- [ ] Reduce false positives with better rules
+- [ ] Enrich events with Docker container name/image
+- [ ] JSON logging
+- [ ] Severity levels (`INFO`, `LOW`, `MEDIUM`, `HIGH`)
+- [ ] Optional network/file-related detectors
+
+---
+
+## Disclaimer
+
+This project is for **education and research**.
+Do not use it as a complete runtime security solution.
+
+---
 
 ## License
 
