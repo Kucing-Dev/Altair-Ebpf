@@ -1,13 +1,19 @@
 use aya::{include_bytes_aligned, maps::RingBuf, programs::TracePoint, Ebpf};
 use aya_log::EbpfLogger;
 use altair_ebpf_common::ExecEvent;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::convert::TryInto;
+use std::env;
 use std::fs;
-use std::sync::Mutex;
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use tokio::signal;
 
-fn print_banner() {
+fn print_banner(container_only: bool) {
     println!(
         r#"
 ╔══════════════════════════════════════════════════════╗
@@ -16,72 +22,169 @@ fn print_banner() {
 ╚══════════════════════════════════════════════════════╝
 "#
     );
+
+    if container_only {
+        println!("\x1b[1;35m[*]\x1b[0m Mode: \x1b[1;35mCONTAINER-ONLY\x1b[0m (host events hidden)");
+    } else {
+        println!("\x1b[1;36m[*]\x1b[0m Mode: \x1b[1;36mALL EVENTS\x1b[0m (host + container)");
+    }
 }
 
-fn read_cgroup_text(id: u32) -> Option<String> {
-    fs::read_to_string(format!("/proc/{}/cgroup", id)).ok()
+fn read_text(path: &str) -> Option<String> {
+    fs::read_to_string(path).ok()
 }
 
-fn parse_container_id(cgroup_text: &str) -> String {
-    for token in cgroup_text.split(|c| c == '/' || c == '-' || c == '.' || c == ':') {
-        let t = token.trim();
-        if t.len() >= 12 && t.len() <= 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
-            return t.chars().take(12).collect();
+fn read_link(path: &str) -> Option<PathBuf> {
+    fs::read_link(path).ok()
+}
+
+fn cgroup_inode_from_pid(pid: u32) -> Option<u64> {
+    let text = read_text(&format!("/proc/{}/cgroup", pid))?;
+    let rel = text
+        .lines()
+        .rev()
+        .find_map(|l| l.split("::").nth(1))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+
+    let path = if rel.starts_with('/') {
+        format!("/sys/fs/cgroup{rel}")
+    } else {
+        format!("/sys/fs/cgroup/{rel}")
+    };
+
+    let meta = fs::metadata(path).ok()?;
+    Some(meta.ino())
+}
+
+#[derive(Clone, Debug)]
+struct ContainerInfo {
+    id: String,
+    _pid: u32,
+}
+
+#[derive(Default, Clone)]
+struct DockerIndex {
+    by_ns: HashMap<PathBuf, ContainerInfo>,
+    by_cgroup: HashMap<u64, String>,
+}
+
+fn refresh_docker_index() -> DockerIndex {
+    let mut index = DockerIndex::default();
+
+    let output = match Command::new("docker").args(["ps", "-q"]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return index,
+    };
+
+    let ids = String::from_utf8_lossy(&output.stdout);
+    for id in ids.split_whitespace() {
+        let inspect = match Command::new("docker")
+            .args(["inspect", "-f", "{{.State.Pid}} {{.Id}}", id])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+
+        let text = String::from_utf8_lossy(&inspect.stdout);
+        let mut parts = text.split_whitespace();
+        let Some(pid_str) = parts.next() else { continue };
+        let Some(full_id) = parts.next() else { continue };
+        let Ok(pid) = pid_str.parse::<u32>() else { continue };
+        if pid == 0 {
+            continue;
+        }
+
+        let short_id: String = full_id.chars().take(12).collect();
+        let info = ContainerInfo {
+            id: short_id.clone(),
+            _pid: pid,
+        };
+
+        if let Some(ns) = read_link(&format!("/proc/{}/ns/pid", pid)) {
+            index.by_ns.insert(ns, info);
+        }
+
+        if let Some(ino) = cgroup_inode_from_pid(pid) {
+            index.by_cgroup.insert(ino, short_id);
         }
     }
-    "n/a".to_string()
+
+    index
 }
 
-fn is_container_cgroup_text(cgroup_text: &str) -> bool {
-    let lower = cgroup_text.to_lowercase();
-    lower.contains("docker")
-        || lower.contains("containerd")
-        || lower.contains("podman")
-        || lower.contains("libpod")
-        || lower.contains("cri-containerd")
-        || lower.contains("kubepods")
-        || lower.contains("lxc")
-        || lower.contains(".scope")
-}
+fn detect_container(event: &ExecEvent, docker: &Mutex<DockerIndex>) -> (bool, String) {
+    let docker = docker.lock().unwrap();
 
-fn detect_container(
-    event: &ExecEvent,
-    host_cgroup_id: u64,
-    known_container_cgroups: &Mutex<HashSet<u64>>,
-) -> (bool, String) {
-    // 1) Coba baca /proc dulu (paling akurat kalau process masih hidup)
-    if let Some(text) = read_cgroup_text(event.tgid).or_else(|| read_cgroup_text(event.pid)) {
-        if is_container_cgroup_text(&text) {
-            let mut set = known_container_cgroups.lock().unwrap();
-            set.insert(event.cgroup_id);
-            return (true, parse_container_id(&text));
+    // 1) cocokkan cgroup_id dari eBPF
+    if event.cgroup_id != 0 {
+        if let Some(cid) = docker.by_cgroup.get(&event.cgroup_id) {
+            return (true, cid.clone());
         }
     }
 
-    // 2) Fallback: bedakan lewat cgroup_id dari kernel
-    //    Kalau cgroup_id berbeda dari proses host Altair, kemungkinan besar container/runtime lain.
-    if event.cgroup_id != 0 && event.cgroup_id != host_cgroup_id {
-        let mut set = known_container_cgroups.lock().unwrap();
-        set.insert(event.cgroup_id);
-        return (true, format!("cg:{}", event.cgroup_id));
+    // 2) cocokkan pid namespace
+    for id in [event.tgid, event.pid] {
+        if let Some(ns) = read_link(&format!("/proc/{}/ns/pid", id)) {
+            if let Some(info) = docker.by_ns.get(&ns) {
+                return (true, info.id.clone());
+            }
+        }
     }
 
-    // 3) Kalau cgroup_id ini pernah terdeteksi sebagai container sebelumnya
-    {
-        let set = known_container_cgroups.lock().unwrap();
-        if set.contains(&event.cgroup_id) {
-            return (true, format!("cg:{}", event.cgroup_id));
+    // 3) fallback teks cgroup (hanya pola docker/container runtime)
+    for id in [event.tgid, event.pid] {
+        if let Some(text) = read_text(&format!("/proc/{}/cgroup", id)) {
+            let lower = text.to_lowercase();
+            if lower.contains("docker")
+                || lower.contains("containerd")
+                || lower.contains("podman")
+                || lower.contains("libpod")
+            {
+                let cid = text
+                    .split(|c| c == '/' || c == '-' || c == '.' || c == ':')
+                    .find(|t| {
+                        t.len() >= 12
+                            && t.len() <= 64
+                            && t.chars().all(|ch| ch.is_ascii_hexdigit())
+                    })
+                    .map(|t| t.chars().take(12).collect())
+                    .unwrap_or_else(|| format!("cg:{}", event.cgroup_id));
+                return (true, cid);
+            }
         }
     }
 
     (false, "n/a".to_string())
 }
 
-fn print_event(
-    event: &ExecEvent,
-    host_cgroup_id: u64,
-    known_container_cgroups: &Mutex<HashSet<u64>>,
-) {
+fn is_self_noise(comm: &str, filename: &str, event: &ExecEvent) -> bool {
+    // event dari binary Altair sendiri
+    if comm == "altair-ebpf" {
+        return true;
+    }
+
+    // pemanggilan docker CLI oleh process Altair (tracking internal)
+    if event.tgid == std::process::id() && filename.ends_with("/docker") {
+        return true;
+    }
+
+    // path docker CLI yang sering muncul dari refresh internal
+    if filename.ends_with("/docker")
+        && (filename.contains("/usr/bin/docker")
+            || filename.contains("/usr/local/bin/docker")
+            || filename.contains("/usr/sbin/docker")
+            || filename.contains("/usr/local/sbin/docker"))
+        && comm == "altair-ebpf"
+    {
+        return true;
+    }
+
+    false
+}
+
+fn print_event(event: &ExecEvent, docker: &Mutex<DockerIndex>, container_only: bool) {
     let comm = String::from_utf8_lossy(&event.comm)
         .trim_end_matches('\0')
         .to_string();
@@ -91,17 +194,29 @@ fn print_event(
     )
     .to_string();
 
-    let (is_container, container_id) =
-        detect_container(event, host_cgroup_id, known_container_cgroups);
-    let scope = if is_container { "CONTAINER" } else { "HOST" };
+    // filter noise internal
+    if is_self_noise(&comm, &filename, event) {
+        return;
+    }
 
+    let (is_container, container_id) = detect_container(event, docker);
+
+    // fitur 2: hanya tampilkan container
+    if container_only && !is_container {
+        return;
+    }
+
+    let scope = if is_container { "CONTAINER" } else { "HOST" };
     let is_root = event.uid == 0;
-    let suspicious = filename.contains("bash")
-        || filename.contains("/sh")
-        || filename.contains("nc")
-        || filename.contains("curl")
-        || filename.contains("wget")
-        || filename.contains("python");
+
+    let suspicious = filename.ends_with("/bash")
+        || filename.ends_with("/sh")
+        || filename.ends_with("/ash")
+        || filename.ends_with("/busybox")
+        || filename.contains("/curl")
+        || filename.contains("/wget")
+        || filename.contains("/python")
+        || filename.contains("/nc");
 
     if is_container && is_root && suspicious {
         println!("\x1b[1;31m┌─ ALERT [CONTAINER] ─────────────────────────────\x1b[0m");
@@ -129,25 +244,38 @@ fn print_event(
     }
 }
 
-fn host_cgroup_id() -> u64 {
-    // Ambil cgroup_id process Altair sendiri lewat /proc/self
-    // Fallback 0 kalau gagal
-    // Catatan: ini approximate; pembeda utama tetap event.cgroup_id dari kernel.
-    let text = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    // tidak selalu bisa map text -> id, jadi kembalikan 0 dan andalkan perbandingan dinamis
-    let _ = text;
-    0
+fn print_help() {
+    println!(
+        r#"
+Altair eBPF - Runtime Detector
+
+USAGE:
+  sudo ./target/debug/altair-ebpf [OPTIONS]
+
+OPTIONS:
+  --container-only   Show only container events (hide host)
+  --all              Show host + container events (default)
+  -h, --help         Show this help
+"#
+    );
 }
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    print_banner();
+    let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print_help();
+        return Ok(());
+    }
+
+    let container_only = args.iter().any(|a| a == "--container-only");
+    print_banner(container_only);
 
     let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/altair-ebpf"
     )))?;
-
     let _ = EbpfLogger::init(&mut bpf);
 
     let program: &mut TracePoint = bpf
@@ -157,18 +285,25 @@ async fn main() -> Result<(), anyhow::Error> {
     program.load()?;
     program.attach("syscalls", "sys_enter_execve")?;
 
-    let host_cg = host_cgroup_id();
-    let known_container_cgroups = Mutex::new(HashSet::<u64>::new());
+    let docker_index = Arc::new(Mutex::new(refresh_docker_index()));
+
+    {
+        let docker_index = Arc::clone(&docker_index);
+        thread::spawn(move || loop {
+            let fresh = refresh_docker_index();
+            if let Ok(mut guard) = docker_index.lock() {
+                *guard = fresh;
+            }
+            thread::sleep(Duration::from_secs(1));
+        });
+    }
 
     println!("\x1b[1;32m[✓]\x1b[0m eBPF program loaded");
     println!("\x1b[1;32m[✓]\x1b[0m Attached to sys_enter_execve");
-    println!("\x1b[1;32m[✓]\x1b[0m Container awareness enabled (cgroup_id)");
+    println!("\x1b[1;32m[✓]\x1b[0m Docker tracking via PID ns + cgroup inode");
     println!("\x1b[1;33m[*]\x1b[0m Listening... (Ctrl+C to stop)\n");
 
     let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
-
-    // Bootstrap: catat cgroup_id host dari beberapa event awal yang jelas host-like
-    // (dilakukan dinamis di detect_container)
 
     loop {
         tokio::select! {
@@ -179,7 +314,7 @@ async fn main() -> Result<(), anyhow::Error> {
             _ = async {
                 if let Some(item) = ring_buf.next() {
                     let event: ExecEvent = *bytemuck::from_bytes(&item);
-                    print_event(&event, host_cg, &known_container_cgroups);
+                    print_event(&event, &docker_index, container_only);
                 }
             } => {}
         }
