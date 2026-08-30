@@ -13,21 +13,68 @@ use std::thread;
 use std::time::Duration;
 use tokio::signal;
 
-fn print_banner(container_only: bool) {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Severity {
+    Info = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
+}
+
+impl Severity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Severity::Info => "INFO",
+            Severity::Low => "LOW",
+            Severity::Medium => "MEDIUM",
+            Severity::High => "HIGH",
+        }
+    }
+
+    fn color(self) -> &'static str {
+        match self {
+            Severity::Info => "\x1b[1;36m",
+            Severity::Low => "\x1b[1;33m",
+            Severity::Medium => "\x1b[1;35m",
+            Severity::High => "\x1b[1;31m",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "info" => Some(Severity::Info),
+            "low" => Some(Severity::Low),
+            "medium" | "med" => Some(Severity::Medium),
+            "high" => Some(Severity::High),
+            _ => None,
+        }
+    }
+}
+
+struct Findings {
+    severity: Severity,
+    reason: &'static str,
+}
+
+fn print_banner(container_only: bool, min_severity: Severity) {
     println!(
         r#"
 ╔══════════════════════════════════════════════════════╗
 ║              ALTAIR eBPF Runtime Detector            ║
-║     Process + Container Awareness • Rust + Aya       ║
+║    Container Awareness + Severity Rules • Rust/Aya   ║
 ╚══════════════════════════════════════════════════════╝
 "#
     );
 
     if container_only {
-        println!("\x1b[1;35m[*]\x1b[0m Mode: \x1b[1;35mCONTAINER-ONLY\x1b[0m (host events hidden)");
+        println!("\x1b[1;35m[*]\x1b[0m Mode: \x1b[1;35mCONTAINER-ONLY\x1b[0m");
     } else {
-        println!("\x1b[1;36m[*]\x1b[0m Mode: \x1b[1;36mALL EVENTS\x1b[0m (host + container)");
+        println!("\x1b[1;36m[*]\x1b[0m Mode: \x1b[1;36mALL EVENTS\x1b[0m");
     }
+    println!(
+        "\x1b[1;36m[*]\x1b[0m Min severity: \x1b[1;36m{}\x1b[0m",
+        min_severity.as_str()
+    );
 }
 
 fn read_text(path: &str) -> Option<String> {
@@ -117,14 +164,12 @@ fn refresh_docker_index() -> DockerIndex {
 fn detect_container(event: &ExecEvent, docker: &Mutex<DockerIndex>) -> (bool, String) {
     let docker = docker.lock().unwrap();
 
-    // 1) cocokkan cgroup_id dari eBPF
     if event.cgroup_id != 0 {
         if let Some(cid) = docker.by_cgroup.get(&event.cgroup_id) {
             return (true, cid.clone());
         }
     }
 
-    // 2) cocokkan pid namespace
     for id in [event.tgid, event.pid] {
         if let Some(ns) = read_link(&format!("/proc/{}/ns/pid", id)) {
             if let Some(info) = docker.by_ns.get(&ns) {
@@ -133,7 +178,6 @@ fn detect_container(event: &ExecEvent, docker: &Mutex<DockerIndex>) -> (bool, St
         }
     }
 
-    // 3) fallback teks cgroup (hanya pola docker/container runtime)
     for id in [event.tgid, event.pid] {
         if let Some(text) = read_text(&format!("/proc/{}/cgroup", id)) {
             let lower = text.to_lowercase();
@@ -160,31 +204,152 @@ fn detect_container(event: &ExecEvent, docker: &Mutex<DockerIndex>) -> (bool, St
 }
 
 fn is_self_noise(comm: &str, filename: &str, event: &ExecEvent) -> bool {
-    // event dari binary Altair sendiri
     if comm == "altair-ebpf" {
         return true;
     }
-
-    // pemanggilan docker CLI oleh process Altair (tracking internal)
     if event.tgid == std::process::id() && filename.ends_with("/docker") {
         return true;
     }
-
-    // path docker CLI yang sering muncul dari refresh internal
-    if filename.ends_with("/docker")
-        && (filename.contains("/usr/bin/docker")
-            || filename.contains("/usr/local/bin/docker")
-            || filename.contains("/usr/sbin/docker")
-            || filename.contains("/usr/local/sbin/docker"))
-        && comm == "altair-ebpf"
-    {
-        return true;
-    }
-
     false
 }
 
-fn print_event(event: &ExecEvent, docker: &Mutex<DockerIndex>, container_only: bool) {
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn is_whitelisted(filename: &str) -> bool {
+    matches!(
+        basename(filename),
+        // command normal / sering muncul
+        "ls" | "whoami" | "id" | "pwd" | "cat" | "echo"
+            | "true" | "false" | "basename" | "dirname"
+            | "head" | "tail" | "tr" | "grep" | "sed"
+            | "awk" | "sort" | "find" | "uname" | "date"
+            | "which" | "tput" | "dircolors" | "lesspipe"
+            | "env" | "printenv" | "ps" | "sleep"
+    )
+}
+
+fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
+    // whitelist: selalu INFO
+    if is_whitelisted(filename) {
+        return Findings {
+            severity: Severity::Info,
+            reason: if is_container {
+                "container process execution (whitelisted)"
+            } else {
+                "host process execution (whitelisted)"
+            },
+        };
+    }
+
+    let bin = basename(filename);
+    let is_root = uid == 0;
+
+    let is_shell = matches!(bin, "sh" | "bash" | "ash" | "zsh" | "dash" | "busybox");
+    let is_net_tool = matches!(
+        bin,
+        "curl" | "wget" | "nc" | "ncat" | "netcat" | "nmap" | "dig" | "socat"
+    );
+    let is_pkg_mgr = matches!(
+        bin,
+        "apk" | "apt" | "apt-get" | "dpkg" | "yum" | "dnf" | "microdnf" | "pip" | "pip3"
+    );
+    let is_compiler = matches!(bin, "gcc" | "g++" | "make" | "cc" | "python" | "python3" | "perl");
+    let is_privesc_tool = matches!(bin, "sudo" | "su" | "chmod" | "chown" | "setcap");
+
+    if is_container {
+        if is_root && is_shell {
+            return Findings {
+                severity: Severity::High,
+                reason: "root interactive shell inside container",
+            };
+        }
+        if is_root && is_net_tool {
+            return Findings {
+                severity: Severity::High,
+                reason: "root network tool inside container",
+            };
+        }
+        if is_root && is_pkg_mgr {
+            return Findings {
+                severity: Severity::Medium,
+                reason: "package manager executed as root in container",
+            };
+        }
+        if is_root && is_compiler {
+            return Findings {
+                severity: Severity::Medium,
+                reason: "compiler/runtime toolchain used as root in container",
+            };
+        }
+        if is_root && is_privesc_tool {
+            return Findings {
+                severity: Severity::Medium,
+                reason: "privilege-related binary in container",
+            };
+        }
+        if is_shell {
+            return Findings {
+                severity: Severity::Low,
+                reason: "shell executed inside container",
+            };
+        }
+        return Findings {
+            severity: Severity::Info,
+            reason: "container process execution",
+        };
+    }
+
+    if is_root && is_net_tool {
+        return Findings {
+            severity: Severity::Low,
+            reason: "root network tool on host",
+        };
+    }
+
+    Findings {
+        severity: Severity::Info,
+        reason: "host process execution",
+    }
+}
+
+fn print_alert(
+    severity: Severity,
+    event: &ExecEvent,
+    comm: &str,
+    filename: &str,
+    container_id: &str,
+    is_container: bool,
+    reason: &str,
+) {
+    let c = severity.color();
+    let scope = if is_container { "CONTAINER" } else { "HOST" };
+
+    println!(
+        "{c}┌─ ALERT [{scope}/{sev}] ──────────────────────────\x1b[0m",
+        scope = scope,
+        sev = severity.as_str()
+    );
+    println!("{c}│\x1b[0m  PID         : {}", event.tgid);
+    println!("{c}│\x1b[0m  UID         : {}", event.uid);
+    println!("{c}│\x1b[0m  COMM        : {}", comm);
+    println!("{c}│\x1b[0m  BINARY      : {}", filename);
+    if is_container {
+        println!("{c}│\x1b[0m  CONTAINER   : {}", container_id);
+        println!("{c}│\x1b[0m  CGROUP_ID   : {}", event.cgroup_id);
+    }
+    println!("{c}│\x1b[0m  SEVERITY    : {}", severity.as_str());
+    println!("{c}│\x1b[0m  REASON      : {}", reason);
+    println!("{c}└────────────────────────────────────────────────\x1b[0m\n");
+}
+
+fn print_event(
+    event: &ExecEvent,
+    docker: &Mutex<DockerIndex>,
+    container_only: bool,
+    min_severity: Severity,
+) {
     let comm = String::from_utf8_lossy(&event.comm)
         .trim_end_matches('\0')
         .to_string();
@@ -194,52 +359,45 @@ fn print_event(event: &ExecEvent, docker: &Mutex<DockerIndex>, container_only: b
     )
     .to_string();
 
-    // filter noise internal
     if is_self_noise(&comm, &filename, event) {
         return;
     }
 
     let (is_container, container_id) = detect_container(event, docker);
-
-    // fitur 2: hanya tampilkan container
     if container_only && !is_container {
         return;
     }
 
-    let scope = if is_container { "CONTAINER" } else { "HOST" };
-    let is_root = event.uid == 0;
+    let findings = evaluate_rules(is_container, event.uid, &filename);
 
-    let suspicious = filename.ends_with("/bash")
-        || filename.ends_with("/sh")
-        || filename.ends_with("/ash")
-        || filename.ends_with("/busybox")
-        || filename.contains("/curl")
-        || filename.contains("/wget")
-        || filename.contains("/python")
-        || filename.contains("/nc");
-
-    if is_container && is_root && suspicious {
-        println!("\x1b[1;31m┌─ ALERT [CONTAINER] ─────────────────────────────\x1b[0m");
-        println!("\x1b[1;31m│\x1b[0m  PID         : {}", event.tgid);
-        println!("\x1b[1;31m│\x1b[0m  UID         : {}", event.uid);
-        println!("\x1b[1;31m│\x1b[0m  COMM        : {}", comm);
-        println!("\x1b[1;31m│\x1b[0m  BINARY      : {}", filename);
-        println!("\x1b[1;31m│\x1b[0m  CONTAINER   : {}", container_id);
-        println!("\x1b[1;31m│\x1b[0m  CGROUP_ID   : {}", event.cgroup_id);
-        println!("\x1b[1;31m│\x1b[0m  REASON      : root shell/tool inside container");
-        println!("\x1b[1;31m└────────────────────────────────────────────────\x1b[0m\n");
+    // filter severity
+    if findings.severity < min_severity {
         return;
     }
 
+    if findings.severity != Severity::Info {
+        print_alert(
+            findings.severity,
+            event,
+            &comm,
+            &filename,
+            &container_id,
+            is_container,
+            findings.reason,
+        );
+        return;
+    }
+
+    // INFO events
     if is_container {
         println!(
-            "\x1b[1;35m•\x1b[0m [\x1b[1;35m{}\x1b[0m] pid={:<6} uid={:<5} comm={:<12} cid={:<14} \x1b[32m→\x1b[0m {}",
-            scope, event.tgid, event.uid, comm, container_id, filename
+            "\x1b[1;35m•\x1b[0m [\x1b[1;35mCONTAINER\x1b[0m] pid={:<6} uid={:<5} comm={:<12} cid={:<14} \x1b[32m→\x1b[0m {}",
+            event.tgid, event.uid, comm, container_id, filename
         );
     } else {
         println!(
-            "\x1b[1;36m•\x1b[0m [\x1b[90m{}\x1b[0m] pid={:<6} uid={:<5} comm={:<12} \x1b[32m→\x1b[0m {}",
-            scope, event.tgid, event.uid, comm, filename
+            "\x1b[1;36m•\x1b[0m [\x1b[90mHOST\x1b[0m] pid={:<6} uid={:<5} comm={:<12} \x1b[32m→\x1b[0m {}",
+            event.tgid, event.uid, comm, filename
         );
     }
 }
@@ -253,24 +411,52 @@ USAGE:
   sudo ./target/debug/altair-ebpf [OPTIONS]
 
 OPTIONS:
-  --container-only   Show only container events (hide host)
-  --all              Show host + container events (default)
-  -h, --help         Show this help
+  --container-only              Show only container events
+  --all                         Show host + container events (default)
+  --min-severity <level>        info | low | medium | high (default: info)
+  -h, --help                    Show this help
+
+EXAMPLES:
+  sudo ./target/debug/altair-ebpf --container-only
+  sudo ./target/debug/altair-ebpf --container-only --min-severity medium
+  sudo ./target/debug/altair-ebpf --min-severity high
 "#
     );
+}
+
+fn parse_args() -> (bool, Severity) {
+    let args: Vec<String> = env::args().collect();
+    let container_only = args.iter().any(|a| a == "--container-only");
+
+    let mut min_severity = Severity::Info;
+    if let Some(i) = args.iter().position(|a| a == "--min-severity") {
+        if let Some(v) = args.get(i + 1) {
+            if let Some(sev) = Severity::parse(v) {
+                min_severity = sev;
+            } else {
+                eprintln!("Invalid --min-severity value: {v}");
+                eprintln!("Use: info | low | medium | high");
+                std::process::exit(1);
+            }
+        } else {
+            eprintln!("Missing value for --min-severity");
+            std::process::exit(1);
+        }
+    }
+
+    (container_only, min_severity)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let args: Vec<String> = env::args().collect();
-
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_help();
         return Ok(());
     }
 
-    let container_only = args.iter().any(|a| a == "--container-only");
-    print_banner(container_only);
+    let (container_only, min_severity) = parse_args();
+    print_banner(container_only, min_severity);
 
     let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -286,7 +472,6 @@ async fn main() -> Result<(), anyhow::Error> {
     program.attach("syscalls", "sys_enter_execve")?;
 
     let docker_index = Arc::new(Mutex::new(refresh_docker_index()));
-
     {
         let docker_index = Arc::clone(&docker_index);
         thread::spawn(move || loop {
@@ -300,7 +485,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     println!("\x1b[1;32m[✓]\x1b[0m eBPF program loaded");
     println!("\x1b[1;32m[✓]\x1b[0m Attached to sys_enter_execve");
-    println!("\x1b[1;32m[✓]\x1b[0m Docker tracking via PID ns + cgroup inode");
+    println!("\x1b[1;32m[✓]\x1b[0m Docker tracking enabled");
+    println!("\x1b[1;32m[✓]\x1b[0m Severity rules + whitelist enabled");
     println!("\x1b[1;33m[*]\x1b[0m Listening... (Ctrl+C to stop)\n");
 
     let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
@@ -314,7 +500,7 @@ async fn main() -> Result<(), anyhow::Error> {
             _ = async {
                 if let Some(item) = ring_buf.next() {
                     let event: ExecEvent = *bytemuck::from_bytes(&item);
-                    print_event(&event, &docker_index, container_only);
+                    print_event(&event, &docker_index, container_only, min_severity);
                 }
             } => {}
         }
