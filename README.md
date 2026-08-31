@@ -261,7 +261,7 @@ Detection logic is intentionally simple and may produce false positives or false
 It does **not** classify CVEs and should not be treated as a complete runtime security product.
 
 ---
-//##License
+<!-- License -->
 
 With the exception of eBPF code, altair-ebpf is distributed under the terms
 of either the [MIT license] or the [Apache License] (version 2.0), at your
