@@ -61,7 +61,7 @@ fn print_banner(container_only: bool, min_severity: Severity) {
         r#"
 ╔══════════════════════════════════════════════════════╗
 ║              ALTAIR eBPF Runtime Detector            ║
-║    Container Awareness + Severity Rules • Rust/Aya   ║
+║   Container Awareness + Severity Rules • Rust/Aya    ║
 ╚══════════════════════════════════════════════════════╝
 "#
     );
@@ -220,7 +220,6 @@ fn basename(path: &str) -> &str {
 fn is_whitelisted(filename: &str) -> bool {
     matches!(
         basename(filename),
-        // command normal / sering muncul
         "ls" | "whoami" | "id" | "pwd" | "cat" | "echo"
             | "true" | "false" | "basename" | "dirname"
             | "head" | "tail" | "tr" | "grep" | "sed"
@@ -231,7 +230,6 @@ fn is_whitelisted(filename: &str) -> bool {
 }
 
 fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
-    // whitelist: selalu INFO
     if is_whitelisted(filename) {
         return Findings {
             severity: Severity::Info,
@@ -245,6 +243,7 @@ fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
 
     let bin = basename(filename);
     let is_root = uid == 0;
+    let lower_path = filename.to_ascii_lowercase();
 
     let is_shell = matches!(bin, "sh" | "bash" | "ash" | "zsh" | "dash" | "busybox");
     let is_net_tool = matches!(
@@ -256,9 +255,43 @@ fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
         "apk" | "apt" | "apt-get" | "dpkg" | "yum" | "dnf" | "microdnf" | "pip" | "pip3"
     );
     let is_compiler = matches!(bin, "gcc" | "g++" | "make" | "cc" | "python" | "python3" | "perl");
-    let is_privesc_tool = matches!(bin, "sudo" | "su" | "chmod" | "chown" | "setcap");
+    let is_privesc_tool = matches!(bin, "sudo" | "su" | "chmod" | "chown" | "setcap" | "capsh");
+
+    // Fase 3 sisa: mount + indikasi escape / namespace abuse
+    let is_mount_tool = matches!(
+        bin,
+        "mount" | "umount" | "mount.nfs" | "mount.cifs" | "fusermount" | "fusermount3"
+    );
+    let is_escape_tool = matches!(
+        bin,
+        "nsenter" | "unshare" | "chroot" | "pivot_root" | "setns"
+    );
+
+    // path sensitif pada binary yang dieksekusi (proxy sederhana, bukan file-open monitor)
+    let sensitive_path_exec = lower_path.contains("/proc/1/")
+        || lower_path.contains("/proc/self/root")
+        || lower_path.contains("docker.sock")
+        || lower_path.contains("/var/run/docker.sock");
 
     if is_container {
+        if is_root && is_mount_tool {
+            return Findings {
+                severity: Severity::High,
+                reason: "mount/umount executed as root inside container",
+            };
+        }
+        if is_root && is_escape_tool {
+            return Findings {
+                severity: Severity::High,
+                reason: "namespace/chroot tool executed as root inside container",
+            };
+        }
+        if sensitive_path_exec {
+            return Findings {
+                severity: Severity::High,
+                reason: "execution related to sensitive host/container path",
+            };
+        }
         if is_root && is_shell {
             return Findings {
                 severity: Severity::High,
@@ -301,6 +334,13 @@ fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
         };
     }
 
+    // Host rules
+    if is_root && is_escape_tool {
+        return Findings {
+            severity: Severity::Low,
+            reason: "namespace/chroot tool on host",
+        };
+    }
     if is_root && is_net_tool {
         return Findings {
             severity: Severity::Low,
@@ -369,8 +409,6 @@ fn print_event(
     }
 
     let findings = evaluate_rules(is_container, event.uid, &filename);
-
-    // filter severity
     if findings.severity < min_severity {
         return;
     }
@@ -388,7 +426,6 @@ fn print_event(
         return;
     }
 
-    // INFO events
     if is_container {
         println!(
             "\x1b[1;35m•\x1b[0m [\x1b[1;35mCONTAINER\x1b[0m] pid={:<6} uid={:<5} comm={:<12} cid={:<14} \x1b[32m→\x1b[0m {}",
@@ -419,7 +456,6 @@ OPTIONS:
 EXAMPLES:
   sudo ./target/debug/altair-ebpf --container-only
   sudo ./target/debug/altair-ebpf --container-only --min-severity medium
-  sudo ./target/debug/altair-ebpf --min-severity high
 "#
     );
 }
@@ -435,7 +471,6 @@ fn parse_args() -> (bool, Severity) {
                 min_severity = sev;
             } else {
                 eprintln!("Invalid --min-severity value: {v}");
-                eprintln!("Use: info | low | medium | high");
                 std::process::exit(1);
             }
         } else {
@@ -486,7 +521,7 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("\x1b[1;32m[✓]\x1b[0m eBPF program loaded");
     println!("\x1b[1;32m[✓]\x1b[0m Attached to sys_enter_execve");
     println!("\x1b[1;32m[✓]\x1b[0m Docker tracking enabled");
-    println!("\x1b[1;32m[✓]\x1b[0m Severity rules + whitelist enabled");
+    println!("\x1b[1;32m[✓]\x1b[0m Threat rules enabled (shell/net/mount/escape)");
     println!("\x1b[1;33m[*]\x1b[0m Listening... (Ctrl+C to stop)\n");
 
     let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
