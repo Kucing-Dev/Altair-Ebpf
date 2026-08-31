@@ -4,13 +4,14 @@ use altair_ebpf_common::ExecEvent;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::signal;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -56,25 +57,47 @@ struct Findings {
     reason: &'static str,
 }
 
-fn print_banner(container_only: bool, min_severity: Severity) {
+struct Config {
+    container_only: bool,
+    min_severity: Severity,
+    json_log: Option<PathBuf>,
+    json_all: bool, // true = log semua event lolos filter; false = hanya alert
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn print_banner(cfg: &Config) {
     println!(
         r#"
 ╔══════════════════════════════════════════════════════╗
 ║              ALTAIR eBPF Runtime Detector            ║
-║   Container Awareness + Severity Rules • Rust/Aya    ║
+║         Phases 1-3 + JSON Logging • Rust/Aya         ║
 ╚══════════════════════════════════════════════════════╝
 "#
     );
 
-    if container_only {
+    if cfg.container_only {
         println!("\x1b[1;35m[*]\x1b[0m Mode: \x1b[1;35mCONTAINER-ONLY\x1b[0m");
     } else {
         println!("\x1b[1;36m[*]\x1b[0m Mode: \x1b[1;36mALL EVENTS\x1b[0m");
     }
     println!(
         "\x1b[1;36m[*]\x1b[0m Min severity: \x1b[1;36m{}\x1b[0m",
-        min_severity.as_str()
+        cfg.min_severity.as_str()
     );
+    match &cfg.json_log {
+        Some(p) => println!(
+            "\x1b[1;36m[*]\x1b[0m JSON log: \x1b[1;36m{}\x1b[0m ({})",
+            p.display(),
+            if cfg.json_all { "all events" } else { "alerts only" }
+        ),
+        None => println!("\x1b[1;36m[*]\x1b[0m JSON log: disabled"),
+    }
 }
 
 fn read_text(path: &str) -> Option<String> {
@@ -256,8 +279,6 @@ fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
     );
     let is_compiler = matches!(bin, "gcc" | "g++" | "make" | "cc" | "python" | "python3" | "perl");
     let is_privesc_tool = matches!(bin, "sudo" | "su" | "chmod" | "chown" | "setcap" | "capsh");
-
-    // Fase 3 sisa: mount + indikasi escape / namespace abuse
     let is_mount_tool = matches!(
         bin,
         "mount" | "umount" | "mount.nfs" | "mount.cifs" | "fusermount" | "fusermount3"
@@ -266,8 +287,6 @@ fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
         bin,
         "nsenter" | "unshare" | "chroot" | "pivot_root" | "setns"
     );
-
-    // path sensitif pada binary yang dieksekusi (proxy sederhana, bukan file-open monitor)
     let sensitive_path_exec = lower_path.contains("/proc/1/")
         || lower_path.contains("/proc/self/root")
         || lower_path.contains("docker.sock")
@@ -334,7 +353,6 @@ fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
         };
     }
 
-    // Host rules
     if is_root && is_escape_tool {
         return Findings {
             severity: Severity::Low,
@@ -351,6 +369,53 @@ fn evaluate_rules(is_container: bool, uid: u32, filename: &str) -> Findings {
     Findings {
         severity: Severity::Info,
         reason: "host process execution",
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn write_json_line(
+    path: &PathBuf,
+    event: &ExecEvent,
+    comm: &str,
+    filename: &str,
+    is_container: bool,
+    container_id: &str,
+    findings: &Findings,
+    is_alert: bool,
+) {
+    let scope = if is_container { "CONTAINER" } else { "HOST" };
+    let line = format!(
+        "{{\"ts\":{},\"type\":\"{}\",\"scope\":\"{}\",\"severity\":\"{}\",\"pid\":{},\"uid\":{},\"comm\":\"{}\",\"binary\":\"{}\",\"container\":\"{}\",\"cgroup_id\":{},\"reason\":\"{}\"}}\n",
+        now_unix_ms(),
+        if is_alert { "alert" } else { "event" },
+        scope,
+        findings.severity.as_str(),
+        event.tgid,
+        event.uid,
+        json_escape(comm),
+        json_escape(filename),
+        json_escape(container_id),
+        event.cgroup_id,
+        json_escape(findings.reason),
+    );
+
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -384,12 +449,7 @@ fn print_alert(
     println!("{c}└────────────────────────────────────────────────\x1b[0m\n");
 }
 
-fn print_event(
-    event: &ExecEvent,
-    docker: &Mutex<DockerIndex>,
-    container_only: bool,
-    min_severity: Severity,
-) {
+fn print_event(event: &ExecEvent, docker: &Mutex<DockerIndex>, cfg: &Config) {
     let comm = String::from_utf8_lossy(&event.comm)
         .trim_end_matches('\0')
         .to_string();
@@ -404,16 +464,33 @@ fn print_event(
     }
 
     let (is_container, container_id) = detect_container(event, docker);
-    if container_only && !is_container {
+    if cfg.container_only && !is_container {
         return;
     }
 
     let findings = evaluate_rules(is_container, event.uid, &filename);
-    if findings.severity < min_severity {
+    if findings.severity < cfg.min_severity {
         return;
     }
 
-    if findings.severity != Severity::Info {
+    let is_alert = findings.severity != Severity::Info;
+
+    if let Some(path) = &cfg.json_log {
+        if is_alert || cfg.json_all {
+            write_json_line(
+                path,
+                event,
+                &comm,
+                &filename,
+                is_container,
+                &container_id,
+                &findings,
+                is_alert,
+            );
+        }
+    }
+
+    if is_alert {
         print_alert(
             findings.severity,
             event,
@@ -449,20 +526,22 @@ USAGE:
 
 OPTIONS:
   --container-only              Show only container events
-  --all                         Show host + container events (default)
   --min-severity <level>        info | low | medium | high (default: info)
+  --json-log <path>             Append JSONL events/alerts to file
+  --json-all                    With --json-log, write all printed events (not only alerts)
   -h, --help                    Show this help
 
 EXAMPLES:
-  sudo ./target/debug/altair-ebpf --container-only
   sudo ./target/debug/altair-ebpf --container-only --min-severity medium
+  sudo ./target/debug/altair-ebpf --container-only --min-severity medium --json-log /tmp/altair.jsonl
 "#
     );
 }
 
-fn parse_args() -> (bool, Severity) {
+fn parse_args() -> Config {
     let args: Vec<String> = env::args().collect();
     let container_only = args.iter().any(|a| a == "--container-only");
+    let json_all = args.iter().any(|a| a == "--json-all");
 
     let mut min_severity = Severity::Info;
     if let Some(i) = args.iter().position(|a| a == "--min-severity") {
@@ -479,7 +558,22 @@ fn parse_args() -> (bool, Severity) {
         }
     }
 
-    (container_only, min_severity)
+    let mut json_log = None;
+    if let Some(i) = args.iter().position(|a| a == "--json-log") {
+        if let Some(v) = args.get(i + 1) {
+            json_log = Some(PathBuf::from(v));
+        } else {
+            eprintln!("Missing value for --json-log");
+            std::process::exit(1);
+        }
+    }
+
+    Config {
+        container_only,
+        min_severity,
+        json_log,
+        json_all,
+    }
 }
 
 #[tokio::main]
@@ -490,8 +584,8 @@ async fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    let (container_only, min_severity) = parse_args();
-    print_banner(container_only, min_severity);
+    let cfg = parse_args();
+    print_banner(&cfg);
 
     let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -521,7 +615,8 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("\x1b[1;32m[✓]\x1b[0m eBPF program loaded");
     println!("\x1b[1;32m[✓]\x1b[0m Attached to sys_enter_execve");
     println!("\x1b[1;32m[✓]\x1b[0m Docker tracking enabled");
-    println!("\x1b[1;32m[✓]\x1b[0m Threat rules enabled (shell/net/mount/escape)");
+    println!("\x1b[1;32m[✓]\x1b[0m Threat rules enabled");
+    println!("\x1b[1;32m[✓]\x1b[0m JSON logging ready");
     println!("\x1b[1;33m[*]\x1b[0m Listening... (Ctrl+C to stop)\n");
 
     let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
@@ -535,7 +630,7 @@ async fn main() -> Result<(), anyhow::Error> {
             _ = async {
                 if let Some(item) = ring_buf.next() {
                     let event: ExecEvent = *bytemuck::from_bytes(&item);
-                    print_event(&event, &docker_index, container_only, min_severity);
+                    print_event(&event, &docker_index, &cfg);
                 }
             } => {}
         }
