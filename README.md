@@ -1,7 +1,9 @@
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/998c35d1-5ea0-4087-9cf0-50388b8851e4" width="400" alt="Altair-Ebpf Logo">
+  <img src="https://github.com/user-attachments/assets/9cc35bf5-4845-44fc-996f-a43f6317c9e3" alt="my logo" style="width: 50%;">
 </p>
+
+
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white">
