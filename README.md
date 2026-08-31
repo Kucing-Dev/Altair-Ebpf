@@ -6,7 +6,7 @@
 
 # Altair eBPF
 
-Runtime process execution monitor built with **Rust + eBPF (Aya)**, focused on **Docker/container runtime visibility** and simple behavioral alerting.
+Runtime process execution monitor built with **Rust + eBPF (Aya)**, focused on **Docker/container runtime visibility**, behavioral alerting, and simple JSON logging.
 
 > Status: **Learning / Prototype**  
 > Not a production EDR/CDR or vulnerability scanner.
@@ -19,14 +19,16 @@ Altair attaches to the Linux kernel tracepoint `sys_enter_execve` and monitors p
 
 Pipeline:
 
-1. **Fase 1 – Basic monitoring**  
-   Capture PID/UID/comm/filename in eBPF and stream events to userspace via RingBuf
-2. **Fase 2 – Container awareness**  
+1. **Phase 1 – Basic monitoring**  
+   Capture PID/UID/comm/filename in eBPF and stream events via RingBuf
+2. **Phase 2 – Container awareness**  
    Classify `HOST` vs `CONTAINER`, support `--container-only`
-3. **Fase 3 – Threat rules**  
-   Severity scoring (`INFO` / `LOW` / `MEDIUM` / `HIGH`) for suspicious container behavior
+3. **Phase 3 – Threat rules**  
+   Severity scoring (`INFO` / `LOW` / `MEDIUM` / `HIGH`)
+4. **Phase 4 (partial) – Export**  
+   JSONL logging for alerts/events
 
-All earlier stages are still active and required by later stages.
+Earlier phases remain active and are required by later phases.
 
 ---
 
@@ -34,15 +36,15 @@ All earlier stages are still active and required by later stages.
 
 ### This project is
 - a runtime **behavioral** detector
-- focused on process execution inside Linux/Docker
+- focused on process execution in Linux/Docker
 - useful for learning eBPF + container security concepts
 
 ### This project is not
 - a CVE/vulnerability scanner
 - a replacement for Trivy/Grype/Snyk
-- a full SOC detection platform
+- a full SOC platform
 
-Severity levels are based on **behavioral rules**, not CVSS scores.
+Severity is based on **behavioral rules**, not CVSS.
 
 ---
 
@@ -50,21 +52,21 @@ Severity levels are based on **behavioral rules**, not CVSS scores.
 
 ### Implemented
 
-**Fase 1 – Basic process monitoring**
-- eBPF attach on `sys_enter_execve`
+**Phase 1 – Basic process monitoring**
+- eBPF on `sys_enter_execve`
 - Collect PID/TGID, UID, `comm`, filename
-- Kernel → userspace event streaming via RingBuf
+- RingBuf kernel → userspace streaming
 - Terminal output
 
-**Fase 2 – Container awareness**
-- Detect container context using:
+**Phase 2 – Container awareness**
+- Detect container context via:
   - Docker PID namespace correlation
   - cgroup inode correlation
   - `/proc/<pid>/cgroup` fallback
 - `--container-only` mode
 - Internal noise filtering
 
-**Fase 3 – Threat rules**
+**Phase 3 – Threat rules**
 - Severity model: `INFO` / `LOW` / `MEDIUM` / `HIGH`
 - `--min-severity` filter
 - Benign binary whitelist
@@ -75,12 +77,17 @@ Severity levels are based on **behavioral rules**, not CVSS scores.
   - mount/umount in container
   - namespace/chroot-related tools (`nsenter`, `unshare`, ...)
 
-### Not implemented yet (Fase 4+)
-- True file-open monitoring (`security_file_open`)
+**Phase 4 (partial) – JSON export**
+- `--json-log <path>` write JSONL
+- `--json-all` optionally log all printed events
+- default JSON mode logs alerts only
+
+### Not implemented yet
 - Network connect monitoring (`tcp_connect`)
+- File-open monitoring (`security_file_open`)
 - Docker name/image metadata enrichment
-- JSON logging / Prometheus export
-- Auto-response actions
+- Prometheus metrics
+- Auto-response / process kill
 
 ---
 
@@ -96,7 +103,8 @@ Linux Kernel
                           ├─ detect HOST vs CONTAINER
                           ├─ apply filters
                           ├─ evaluate severity rules
-                          └─ print logs / alerts
+                          ├─ print logs / alerts
+                          └─ optional JSONL export
 ```
 
 ---
@@ -158,21 +166,31 @@ sudo ./target/debug/altair-ebpf --container-only
 sudo ./target/debug/altair-ebpf --container-only --min-severity medium
 ```
 
+### With JSON logging
+
+```bash
+sudo ./target/debug/altair-ebpf \
+  --container-only \
+  --min-severity medium \
+  --json-log /tmp/altair.jsonl
+```
+
 ### Help
 
 ```bash
 ./target/debug/altair-ebpf --help
 ```
 
-
+---
 
 ## CLI options
 
 | Option | Description |
 |------|-------------|
 | `--container-only` | Show only container events |
-| `--all` | Show host + container events |
 | `--min-severity <level>` | `info` \| `low` \| `medium` \| `high` |
+| `--json-log <path>` | Append JSONL records to file |
+| `--json-all` | With `--json-log`, write all printed events (not only alerts) |
 | `-h`, `--help` | Show help |
 
 Default min severity: `info`
@@ -185,14 +203,12 @@ Default min severity: `info`
 |------|---------|----------|
 | `INFO` | Normal execution | `ls`, `whoami` |
 | `LOW` | Mild interest | non-root shell in container |
-| `MEDIUM` | Notable risk behavior | `apk` / `apt` / toolchain as root in container |
+| `MEDIUM` | Notable risk behavior | `apk` / `apt` as root in container |
 | `HIGH` | Strong suspicious behavior | root shell, `wget`/`curl`/`nc`, `mount` in container |
-
-Whitelisted binaries are forced to `INFO` (for example: `ls`, `whoami`, `cat`, `grep`, `ps`, `sleep`, ...).
 
 ---
 
-## Example output
+## Example terminal alert
 
 ```text
 ┌─ ALERT [CONTAINER/HIGH] ──────────────────────────
@@ -204,18 +220,12 @@ Whitelisted binaries are forced to `INFO` (for example: `ls`, `whoami`, `cat`, `
 │  SEVERITY    : HIGH
 │  REASON      : root network tool inside container
 └────────────────────────────────────────────────
+```
 
-┌─ ALERT [CONTAINER/MEDIUM] ──────────────────────────
-│  BINARY      : /sbin/apk
-│  SEVERITY    : MEDIUM
-│  REASON      : package manager executed as root in container
-└────────────────────────────────────────────────
+## Example JSONL
 
-┌─ ALERT [CONTAINER/HIGH] ──────────────────────────
-│  BINARY      : /bin/mount
-│  SEVERITY    : HIGH
-│  REASON      : mount/umount executed as root inside container
-└────────────────────────────────────────────────
+```json
+{"ts":1788181756604,"type":"alert","scope":"CONTAINER","severity":"HIGH","pid":3048,"uid":0,"comm":"sh","binary":"/usr/bin/wget","container":"8430102cfd11","cgroup_id":2712,"reason":"root network tool inside container"}
 ```
 
 ---
@@ -225,7 +235,10 @@ Whitelisted binaries are forced to `INFO` (for example: `ls`, `whoami`, `cat`, `
 Terminal 1:
 
 ```bash
-sudo ./target/debug/altair-ebpf --container-only --min-severity medium
+sudo ./target/debug/altair-ebpf \
+  --container-only \
+  --min-severity medium \
+  --json-log /tmp/altair.jsonl
 ```
 
 Terminal 2:
@@ -238,18 +251,21 @@ apk update
 mount
 ```
 
-Expected:
-- benign commands stay quiet at `medium+`
-- network/package/mount activity raises alerts
+Then:
+
+```bash
+cat /tmp/altair.jsonl
+```
 
 ---
 
 ## Roadmap
 
-- [x] Fase 1: basic execve monitoring
-- [x] Fase 2: container awareness + `--container-only`
-- [x] Fase 3: threat rules + severity + whitelist
-- [ ] Fase 4: file/network hooks, metadata enrichment, JSON logs
+- [x] Phase 1: basic execve monitoring
+- [x] Phase 2: container awareness + `--container-only`
+- [x] Phase 3: threat rules + severity + whitelist
+- [x] Phase 4a: JSONL export
+- [ ] Phase 4b: network/file hooks, metadata, Prometheus
 
 ---
 
@@ -259,6 +275,7 @@ This project is for **education and research**.
 Detection logic is intentionally simple and may produce false positives or false negatives.
 
 It does **not** classify CVEs and should not be treated as a complete runtime security product.
+
 
 ---
 <!-- License -->
