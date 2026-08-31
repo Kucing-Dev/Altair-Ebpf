@@ -3,6 +3,16 @@
   <img src="https://github.com/user-attachments/assets/998c35d1-5ea0-4087-9cf0-50388b8851e4" width="400" alt="Altair-Ebpf Logo">
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white">
+  <img src="https://img.shields.io/badge/eBPF-FF5722?style=for-the-badge&logo=linux&logoColor=white">
+  <img src="https://img.shields.io/badge/Aya-0A66C2?style=for-the-badge&logo=rust&logoColor=white">
+  <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white">
+  <img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black">
+  <img src="https://img.shields.io/badge/CLI-333333?style=for-the-badge&logo=gnubash&logoColor=white">
+  <img src="https://img.shields.io/badge/Runtime%20Security-B71C1C?style=for-the-badge">
+  <img src="https://img.shields.io/badge/MIT-00C853?style=for-the-badge">
+</p>
 
 # Altair eBPF
 
