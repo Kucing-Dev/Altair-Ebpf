@@ -263,24 +263,24 @@ It does **not** classify CVEs and should not be treated as a complete runtime se
 ---
 <!-- License -->
 
-With the exception of eBPF code, altair-ebpf is distributed under the terms
+<!-- With the exception of eBPF code, altair-ebpf is distributed under the terms
 of either the [MIT license] or the [Apache License] (version 2.0), at your
-option.
+option.-->
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
+<!-- Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
+be dual licensed as above, without any additional terms or conditions.-->
 
-### eBPF
+<!-- ### eBPF -->
 
-All eBPF code is distributed under either the terms of the
+<!-- All eBPF code is distributed under either the terms of the
 [GNU General Public License, Version 2] or the [MIT license], at your
-option.
+option.-->
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
+<!-- Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this project by you, as defined in the GPL-2 license, shall be
-dual licensed as above, without any additional terms or conditions.
+dual licensed as above, without any additional terms or conditions.-->
 
-[Apache license]: LICENSE-APACHE
+<!-- [Apache license]: LICENSE-APACHE
 [MIT license]: LICENSE-MIT
-[GNU General Public License, Version 2]: LICENSE-GPL2
+[GNU General Public License, Version 2]: LICENSE-GPL2 -->
