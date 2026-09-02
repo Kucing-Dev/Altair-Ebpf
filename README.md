@@ -277,7 +277,7 @@ cat /tmp/altair.jsonl
 - [x] Phase 2: container awareness + `--container-only`
 - [x] Phase 3: threat rules + severity + whitelist
 - [x] Phase 4a: JSONL export
-- [ ] Phase 4b: network/file hooks, metadata, Prometheus
+- [x] Phase 4b: network/file hooks, metadata, Prometheus
 
 ---
 
